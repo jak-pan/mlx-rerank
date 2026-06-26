@@ -1,0 +1,221 @@
+# mlx-nemo-rerank
+
+A fast, in-process **MLX reranker engine** for
+[`nvidia/llama-nemotron-rerank-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2),
+running natively on Apple Metal. No PyTorch in the process — weights, tokenizer,
+and the full forward pass are all hand-built in Rust on top of
+[`mlx-rs`](https://crates.io/crates/mlx-rs).
+
+It does one thing: take a query and a list of candidate documents, score each
+`(query, document)` pair with the Nemotron-1B cross-encoder, and return them
+reordered best-first. It ships both as a CLI (for benchmarking and one-shot
+scoring) and as a small **Cohere-compatible HTTP `/rerank` server** you can point
+a retrieval pipeline at.
+
+> Companion model card / weights documentation:
+> [`../llama-nemotron-rerank-1b-v2-mlx`](../llama-nemotron-rerank-1b-v2-mlx).
+
+---
+
+## Why this exists
+
+Reranking is the single largest reproducible quality lever in our memory
+benchmark: turning it on (with Cohere `rerank-4-fast`) moved the full 500-question
+LongMemEval-S benchmark **+3.34pp (87.4% → 89.8%)**. First-stage embedding
+retrieval is essentially solved — the gold evidence is in the top-100 for 51/52
+rerank-ON misses (99.8% session-level recall) — so the reranker's entire job is to
+reorder the right evidence to the top. It has to be both **accurate** and **cheap
+enough to run on every query**.
+
+The catch is running a genuinely strong ~1B cross-encoder *locally*. There is no
+off-the-shelf runtime that loads this model on a Mac with any speed. The only
+options were PyTorch-MPS (works, but ~5.5s end-to-end for Nemotron — far too slow)
+or building the inference path by hand in MLX. This is that hand-built path.
+
+What you get:
+
+- **Matches Cohere quality.** On our 50Q stratified, answer-only set, Nemotron-1B
+  here scores **92%** — 46/50, *identical top-3 ranking* — tying Cohere
+  `rerank-4-fast` exactly. It is the only local model we've verified at 92%.
+  Weaker rerankers (bge-reranker-v2-m3 at 86%, jina-reranker-v3 at 84%) fall
+  *below* the no-rerank baseline; you cannot compress your way to 92%, you need
+  the model.
+- **~5x faster than PyTorch.** ~1.43s / 100 docs here vs ~5.5s for Nemotron under
+  PyTorch-MPS, on the identical payload. (Cohere's hosted API is ~0.3s; local is
+  slower but free, offline, and tunable.) Full numbers and the optimization story
+  are in [BENCHMARKS.md](BENCHMARKS.md).
+- **Bit-faithful to the original weights.** Validated against the PyTorch
+  reference: single-doc P(yes) = 0.14934 (MLX) vs 0.15001 (PyTorch), diff 0.0007;
+  batched 100-doc top-3 identical (`[2, 26, 0]`) in both. The gap is only
+  floating-point accumulation order — it is the *same model*.
+
+---
+
+## What it is (architecture)
+
+Nemotron-1B is a standard **Llama-3.2-1B** backbone (16 layers, hidden 2048, 32
+attention heads, 8 KV heads, head_dim 64, RoPE θ=500000 with llama3 scaling) run
+as a **bidirectional** sequence-classification model:
+
+- attention is **non-causal** — the causal mask is replaced by a padding-only
+  bidirectional mask, so every token attends to every other token (encoder-style);
+- pooling is **masked mean** over all non-pad tokens → one vector per
+  `(query, doc)` pair;
+- a **linear score head** `[1, 2048]` projects that vector to a single relevance
+  logit.
+
+The prompt format is `question:{q} \n \n passage:{p}`. Weights are loaded once
+(cast to f16, matching the Python reference), the tokenizer comes straight from
+the HF snapshot, and everything runs on the Metal GPU.
+
+The model is read from your local HuggingFace cache:
+`~/.cache/huggingface/hub/models--nvidia--llama-nemotron-rerank-1b-v2/snapshots/<hash>/`
+(weights, `tokenizer.json`). Make sure the model is downloaded before running.
+
+---
+
+## Build
+
+```sh
+cargo build --release
+```
+
+Produces a single binary, `target/release/rerank`. The only system requirement is
+Apple Silicon + Metal (this is an MLX program); see the footer for the verified
+toolchain.
+
+---
+
+## CLI
+
+The default invocation scores a fixed sample payload (the first record of
+`/tmp/rerank_payloads.jsonl`) and prints the top-3 plus timing — it's the
+benchmarking entry point.
+
+```sh
+# Score 100 docs of the sample payload, print top-3 + min/median/mean timing.
+target/release/rerank
+
+# Limit the number of docs scored (default 100).
+target/release/rerank --ndocs 50
+
+# Override the length-sorted sub-batch size (default 10 — the swept optimum).
+target/release/rerank --subbatch 25
+
+# Sweep sub-batch sizes (100, 50, 25, 10) and report timing for each,
+# plus the tokenization-overlap variant. Reproduces BENCHMARKS.md.
+target/release/rerank --sweep
+
+# Dump per-doc scores in ORIGINAL order to a JSON file (numerical-validation /
+# reference-diff path). Default --ndocs is 3 in this mode.
+target/release/rerank --dump scores.json --ndocs 100
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--ndocs <N>` | 100 (3 with `--dump`) | Number of docs to score from the sample payload. |
+| `--subbatch <N>` | 10 | Length-sorted sub-batch size fed to each forward pass. |
+| `--sweep` | off | Sweep sub-batch sizes + overlap variant; print a timing table. |
+| `--dump <out.json>` | off | Write per-doc scores (original order) for reference diffing. |
+| `--serve` | off | Start the HTTP `/rerank` server instead of running the bench. |
+| `--port <P>` | 8088 | Port for `--serve`. |
+| `--overlap` / `--perchunk` | off | A/B variants of the scoring loop (see BENCHMARKS.md). |
+
+> `--overlap` (tokenization/array-build overlapped on a worker thread) and
+> `--perchunk` (a GPU barrier after every sub-batch) exist to demonstrate that
+> those strategies are **no-ops or regressions** — this forward is compute-bound.
+> The default deferred-eval path is the fast one. Details in
+> [BENCHMARKS.md](BENCHMARKS.md).
+
+---
+
+## The `--serve` HTTP server
+
+```sh
+target/release/rerank --serve            # binds 127.0.0.1:8088
+target/release/rerank --serve --port 9000
+```
+
+On startup it loads the model once, then prints a readiness line that downstream
+tooling waits on:
+
+```
+rerank server ready on http://127.0.0.1:8088
+```
+
+It exposes a **Cohere-compatible** `POST /rerank` endpoint. Request:
+
+```json
+{
+  "query": "what did I order for the commute setup?",
+  "documents": ["...doc 0...", "...doc 1...", "..."],
+  "top_n": 10
+}
+```
+
+(`model` is accepted and ignored; `top_n` is optional — omit it to get all docs
+back.) Response — results sorted by `relevance_score` descending, truncated to
+`top_n`:
+
+```json
+{
+  "results": [
+    { "index": 2,  "relevance_score": 10.31 },
+    { "index": 26, "relevance_score":  9.84 },
+    { "index": 0,  "relevance_score":  8.12 }
+  ]
+}
+```
+
+```sh
+curl -s http://127.0.0.1:8088/rerank \
+  -H 'content-type: application/json' \
+  -d '{"query":"...","documents":["a","b","c"],"top_n":3}'
+```
+
+**Single-threaded by design.** The server handles one request at a time. There is
+exactly one Metal GPU, and the reranker forward is compute-bound on it — running
+requests concurrently would just contend for the same device and add no
+throughput (concurrency measured at 0.87x). One request at a time matches the
+single GPU and the pipeline's cap-1 queue. Any non-`POST /rerank` route returns
+404; malformed bodies return 400; scoring errors return 500.
+
+---
+
+## Pointing a pipeline at it
+
+The server speaks the same `/rerank` shape as Cohere/OpenRouter, so any pipeline
+that talks to a Cohere-style reranker base URL can use it unchanged. In our memory
+stack, set the rerank base URL to the local server:
+
+```sh
+export SYMEM_RERANK_BASE_URL=http://127.0.0.1:8088
+```
+
+The pipeline then POSTs `{query, documents, top_n}` to `${SYMEM_RERANK_BASE_URL}/rerank`
+and reads back `{results: [{index, relevance_score}, ...]}` — no code changes,
+no API key, no per-query cost, fully offline. Start the server first (wait for the
+`rerank server ready` line), then run the pipeline.
+
+---
+
+## See also
+
+- [BENCHMARKS.md](BENCHMARKS.md) — the optimization story and all the numbers
+  (sub-batch sweep, the padding-vs-launch knee, the dead levers, PyTorch/Cohere
+  comparison, numerical validation).
+- [`../llama-nemotron-rerank-1b-v2-mlx`](../llama-nemotron-rerank-1b-v2-mlx) —
+  the model card / weights-side documentation for the MLX port.
+
+---
+
+## Environment (verified)
+
+- **Machine:** MacBook Pro (MacBookPro18,4), Apple M1 Max, 10 CPU cores
+  (8P + 2E), 64 GB unified memory, macOS 26.5.1 (25F80). Apple Silicon
+  unified-memory GPU driven via Metal; MLX runs natively on it.
+- **Toolchain:** rustc 1.93.0 (254b59607 2026-01-19); `mlx-rs` 0.25;
+  `tokenizers` 0.20 (`onig`); `serde` 1 / `serde_json` 1 / `anyhow` 1 /
+  `tiny_http` 0.12; release `opt-level = 3`.
+
+All speed and quality figures above were measured on this machine.
