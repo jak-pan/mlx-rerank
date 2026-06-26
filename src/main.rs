@@ -422,6 +422,126 @@ fn top3(scores: &[f32]) -> Vec<usize> {
     idx.into_iter().take(3).collect()
 }
 
+// ---- HTTP /rerank server (Cohere/OpenRouter-compatible) ----
+
+#[derive(serde::Deserialize)]
+struct RerankRequest {
+    #[allow(dead_code)]
+    #[serde(default)]
+    model: Option<String>,
+    query: String,
+    documents: Vec<String>,
+    #[serde(default)]
+    top_n: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct RerankResult {
+    index: usize,
+    relevance_score: f32,
+}
+
+#[derive(serde::Serialize)]
+struct RerankResponse {
+    results: Vec<RerankResult>,
+}
+
+/// Score documents for one rerank request, reusing the model forward.
+/// Returns results sorted by relevance DESC, truncated to top_n (all if None).
+fn rerank(
+    model: &Model,
+    tok: &Tokenizer,
+    req: &RerankRequest,
+) -> Result<RerankResponse> {
+    if req.documents.is_empty() {
+        return Ok(RerankResponse { results: vec![] });
+    }
+    // Default sub-batch 10 (the fastest config from the sweep).
+    let scores = run(model, tok, &req.query, &req.documents, 10)?;
+    let mut results: Vec<RerankResult> = scores
+        .iter()
+        .enumerate()
+        .map(|(index, &relevance_score)| RerankResult {
+            index,
+            relevance_score,
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(n) = req.top_n {
+        results.truncate(n);
+    }
+    Ok(RerankResponse { results })
+}
+
+/// Synchronous, single-threaded blocking server: one request at a time (matches
+/// the single GPU and the pipeline's cap-1 queue). Loads nothing here; model+tok
+/// are already loaded by the caller.
+fn serve_http(model: &Model, tok: &Tokenizer, port: u16) -> Result<()> {
+    let addr = format!("127.0.0.1:{port}");
+    let server = tiny_http::Server::http(&addr)
+        .map_err(|e| anyhow!("failed to bind {addr}: {e}"))?;
+    // Readiness gate line — exact format other tooling waits on.
+    eprintln!("rerank server ready on http://127.0.0.1:{port}");
+
+    for mut request in server.incoming_requests() {
+        let method = request.method().clone();
+        let url = request.url().to_string();
+        let is_rerank = method == tiny_http::Method::Post && {
+            // strip any query string
+            let path = url.split('?').next().unwrap_or(&url);
+            path == "/rerank"
+        };
+
+        if !is_rerank {
+            let resp = tiny_http::Response::from_string("not found").with_status_code(404);
+            let _ = request.respond(resp);
+            continue;
+        }
+
+        let mut body = String::new();
+        if std::io::Read::read_to_string(request.as_reader(), &mut body).is_err() {
+            let resp = tiny_http::Response::from_string("bad request").with_status_code(400);
+            let _ = request.respond(resp);
+            continue;
+        }
+
+        let req: RerankRequest = match serde_json::from_str(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = tiny_http::Response::from_string(format!("bad request: {e}"))
+                    .with_status_code(400);
+                let _ = request.respond(resp);
+                continue;
+            }
+        };
+
+        let response = match rerank(model, tok, &req) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("rerank error: {e}");
+                let resp = tiny_http::Response::from_string(format!("internal error: {e}"))
+                    .with_status_code(500);
+                let _ = request.respond(resp);
+                continue;
+            }
+        };
+
+        let body = serde_json::to_string(&response)?;
+        let header = tiny_http::Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"application/json"[..],
+        )
+        .unwrap();
+        let resp = tiny_http::Response::from_string(body).with_header(header);
+        let _ = request.respond(resp);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Pin MLX's default device to the Metal GPU so default-device ops use it too.
     Device::set_default(&Device::gpu());
@@ -433,6 +553,8 @@ fn main() -> Result<()> {
     let mut sweep = false;
     let mut overlap = false;
     let mut perchunk = false;
+    let mut serve = false;
+    let mut port: u16 = 8088;
     let mut a = 1;
     while a < args.len() {
         match args[a].as_str() {
@@ -474,6 +596,17 @@ fn main() -> Result<()> {
                 perchunk = true;
                 a += 1;
             }
+            "--serve" => {
+                serve = true;
+                a += 1;
+            }
+            "--port" => {
+                port = args
+                    .get(a + 1)
+                    .ok_or_else(|| anyhow!("--port needs a value"))?
+                    .parse()?;
+                a += 2;
+            }
             _ => a += 1,
         }
     }
@@ -485,6 +618,10 @@ fn main() -> Result<()> {
     let tok = Tokenizer::from_file(dir.join("tokenizer.json"))
         .map_err(|e| anyhow!("tokenizer: {e}"))?;
     eprintln!("loaded in {:?}", load_t.elapsed());
+
+    if serve {
+        return serve_http(&model, &tok, port);
+    }
 
     // payload 0
     let line = std::fs::read_to_string("/tmp/rerank_payloads.jsonl")?
