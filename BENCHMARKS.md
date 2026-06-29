@@ -4,7 +4,7 @@ How this engine got to **~1.43s / 100 docs** for `nvidia/llama-nemotron-rerank-1
 on an Apple M1 Max, what moved the needle, and — just as important — what didn't.
 
 All numbers below were measured on the verified machine (M1 Max, 64 GB, macOS
-26.5.1) on a real 100-document LongMemEval payload (the first record of
+26.5.1) on a real 100-document reranking payload (the first record of
 `/tmp/rerank_payloads.jsonl`), not synthetic uniform-length docs. You can
 reproduce the headline table with `target/release/rerank --sweep`.
 
@@ -122,28 +122,6 @@ PyTorch reference — that's the only thing that makes the rewrite trustworthy:
 
 It is the *same model*, not an approximation. `--dump <out.json>` writes per-doc
 scores in original order for exactly this kind of reference diffing.
-
----
-
-## Quality (for context)
-
-Latency is half the story; the reranker also has to be accurate. On the 50Q
-stratified, answer-only set (sampled to mirror the full LongMemEval-S category mix;
-±6–7% noise at this N):
-
-| Reranker | 50Q accuracy |
-|---|---|
-| Cohere `rerank-4-fast` (remote) | **92%** |
-| **Nemotron-1B MLX (this engine)** | **92%** — 46/50, identical top-3 |
-| No-rerank baseline | 88% |
-| bge-reranker-v2-m3 (568M) | 86% (below baseline) |
-| jina-reranker-v3 (0.6B) | 84% (below baseline) |
-
-Nemotron-1B here **ties Cohere exactly** and is the only local model we've verified
-at 92%. Turning reranking on moved the full 500Q benchmark **+3.34pp
-(87.4% → 89.8%)** — the single largest reproducible lever in the system. You cannot
-compress your way to this number; weaker rerankers land *below* the no-rerank
-baseline.
 
 ---
 

@@ -2,6 +2,12 @@
 name = "mlx-nemo-rerank"
 version = "0.1.0"
 edition = "2021"
+description = "Fast in-process MLX/Metal reranker engine for nvidia/llama-nemotron-rerank-1b-v2 on Apple Silicon — torch-free, with a Cohere-compatible /rerank HTTP server."
+repository = "https://github.com/jak-pan/mlx-nemo-rerank"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["mlx", "reranker", "apple-silicon", "metal", "cross-encoder"]
+categories = ["text-processing", "science"]
 
 [[bin]]
 name = "rerank"

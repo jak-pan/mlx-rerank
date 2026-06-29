@@ -13,19 +13,16 @@ scoring) and as a small **Cohere-compatible HTTP `/rerank` server** you can poin
 a retrieval pipeline at.
 
 > Companion model card / weights documentation:
-> [`../llama-nemotron-rerank-1b-v2-mlx`](../llama-nemotron-rerank-1b-v2-mlx).
+> [`llama-nemotron-rerank-1b-v2-mlx`](https://huggingface.co/jak-pan/llama-nemotron-rerank-1b-v2-mlx).
 
 ---
 
 ## Why this exists
 
-Reranking is the single largest reproducible quality lever in our memory
-benchmark: turning it on (with Cohere `rerank-4-fast`) moved the full 500-question
-LongMemEval-S benchmark **+3.34pp (87.4% → 89.8%)**. First-stage embedding
-retrieval is essentially solved — the gold evidence is in the top-100 for 51/52
-rerank-ON misses (99.8% session-level recall) — so the reranker's entire job is to
-reorder the right evidence to the top. It has to be both **accurate** and **cheap
-enough to run on every query**.
+Reranking is one of the highest-leverage stages in a retrieval pipeline: a strong
+cross-encoder rescores the first-stage candidates so the most relevant evidence
+lands at the top. To be worth running on *every* query it has to be both
+**accurate** and **cheap**.
 
 The catch is running a genuinely strong ~1B cross-encoder *locally*. There is no
 off-the-shelf runtime that loads this model on a Mac with any speed. The only
@@ -34,12 +31,6 @@ or building the inference path by hand in MLX. This is that hand-built path.
 
 What you get:
 
-- **Matches Cohere quality.** On our 50Q stratified, answer-only set, Nemotron-1B
-  here scores **92%** — 46/50, *identical top-3 ranking* — tying Cohere
-  `rerank-4-fast` exactly. It is the only local model we've verified at 92%.
-  Weaker rerankers (bge-reranker-v2-m3 at 86%, jina-reranker-v3 at 84%) fall
-  *below* the no-rerank baseline; you cannot compress your way to 92%, you need
-  the model.
 - **~5x faster than PyTorch.** ~1.43s / 100 docs here vs ~5.5s for Nemotron under
   PyTorch-MPS, on the identical payload. (Cohere's hosted API is ~0.3s; local is
   slower but free, offline, and tunable.) Full numbers and the optimization story
@@ -185,14 +176,14 @@ single GPU and the pipeline's cap-1 queue. Any non-`POST /rerank` route returns
 ## Pointing a pipeline at it
 
 The server speaks the same `/rerank` shape as Cohere/OpenRouter, so any pipeline
-that talks to a Cohere-style reranker base URL can use it unchanged. In our memory
-stack, set the rerank base URL to the local server:
+that talks to a Cohere-style reranker base URL can use it unchanged — just point
+that base URL at the local server:
 
 ```sh
-export SYMEM_RERANK_BASE_URL=http://127.0.0.1:8088
+export RERANK_BASE_URL=http://127.0.0.1:8088
 ```
 
-The pipeline then POSTs `{query, documents, top_n}` to `${SYMEM_RERANK_BASE_URL}/rerank`
+The pipeline then POSTs `{query, documents, top_n}` to `${RERANK_BASE_URL}/rerank`
 and reads back `{results: [{index, relevance_score}, ...]}` — no code changes,
 no API key, no per-query cost, fully offline. Start the server first (wait for the
 `rerank server ready` line), then run the pipeline.
@@ -204,7 +195,7 @@ no API key, no per-query cost, fully offline. Start the server first (wait for t
 - [BENCHMARKS.md](BENCHMARKS.md) — the optimization story and all the numbers
   (sub-batch sweep, the padding-vs-launch knee, the dead levers, PyTorch/Cohere
   comparison, numerical validation).
-- [`../llama-nemotron-rerank-1b-v2-mlx`](../llama-nemotron-rerank-1b-v2-mlx) —
+- [`llama-nemotron-rerank-1b-v2-mlx`](https://huggingface.co/jak-pan/llama-nemotron-rerank-1b-v2-mlx) —
   the model card / weights-side documentation for the MLX port.
 
 ---
@@ -218,4 +209,21 @@ no API key, no per-query cost, fully offline. Start the server first (wait for t
   `tokenizers` 0.20 (`onig`); `serde` 1 / `serde_json` 1 / `anyhow` 1 /
   `tiny_http` 0.12; release `opt-level = 3`.
 
-All speed and quality figures above were measured on this machine.
+All speed figures above were measured on this machine.
+
+---
+
+## License & credits
+
+- **This engine** (the Rust MLX forward pass + server) is released under
+  **Apache-2.0** (see [`LICENSE`](LICENSE)).
+- **The model weights are NVIDIA's** —
+  [`nvidia/llama-nemotron-rerank-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2),
+  loaded from your local Hugging Face cache at runtime. **No weights are
+  redistributed in this repo**; they are governed by NVIDIA's license for that
+  model — verify the terms on the model page before relying on it.
+- Built on [`mlx-rs`](https://crates.io/crates/mlx-rs) and
+  [`tokenizers`](https://crates.io/crates/tokenizers); thanks to the
+  [MLX](https://github.com/ml-explore/mlx) team at Apple.
+- Companion model card:
+  [`jak-pan/llama-nemotron-rerank-1b-v2-mlx`](https://huggingface.co/jak-pan/llama-nemotron-rerank-1b-v2-mlx).
