@@ -65,6 +65,39 @@ The model is read from your local HuggingFace cache:
 
 ---
 
+## Model selection (`RERANK_MODEL`)
+
+The same binary can run a second architecture: **KaLM-Reranker-V1** (a `t5gemma2`
+encoder-decoder reranker, sizes Nano and Small). Select the checkpoint at startup
+with the `RERANK_MODEL` environment variable (an HF repo id); it defaults to
+Nemotron for back-compatibility:
+
+```sh
+# Nemotron (default — unchanged behavior)
+target/release/rerank --serve
+
+# KaLM-Reranker-V1-Small / Nano
+RERANK_MODEL=KaLM-Embedding/KaLM-Reranker-V1-Small target/release/rerank --serve
+RERANK_MODEL=KaLM-Embedding/KaLM-Reranker-V1-Nano  target/release/rerank --serve
+```
+
+One process loads exactly one model. The architecture is auto-detected from the
+snapshot's `config.json` (`model_type: llama_bidirec` → Nemotron;
+`t5gemma2`/`T5Gemma2ForConditionalGeneration` → KaLM), and `model_dir` resolves
+`~/.cache/huggingface/hub/models--<org>--<name>/snapshots/*` for any repo id. The
+CLI surface (`--serve`, `--dump`, etc.) is identical for whichever model is
+selected.
+
+The KaLM path is a torch-free Rust/mlx-rs port of the reference
+`modeling_kalm_mlx.py` (Gemma2 primitives — QK-norm, GQA, gelu-tanh gated MLP,
+sandwich norms, per-layer full/sliding RoPE — plus chunk-pool encoding and a
+merged self+cross-attention decoder). It is config-generalized, so the one
+implementation serves every size in the family. Validated bit-faithful against the
+reference: top-5 ranking identical and per-doc P(yes) within bf16 tolerance
+(max abs diff 0.008 / Small, 0.002 / Nano on a 15-doc set).
+
+---
+
 ## Build
 
 ```sh

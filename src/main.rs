@@ -16,6 +16,11 @@ use anyhow::{anyhow, Context, Result};
 use mlx_rs::{Array, Device, Dtype, StreamOrDevice};
 use tokenizers::Tokenizer;
 
+mod kalm;
+
+/// Default model when RERANK_MODEL is unset (back-compat with the original binary).
+const DEFAULT_MODEL: &str = "nvidia/llama-nemotron-rerank-1b-v2";
+
 const HIDDEN: i32 = 2048;
 const N_LAYERS: usize = 16;
 const N_HEADS: i32 = 32;
@@ -34,9 +39,11 @@ const ROPE_LOW_FREQ: f32 = 1.0;
 const ROPE_HIGH_FREQ: f32 = 4.0;
 const ROPE_ORIG_CTX: f32 = 8192.0;
 
-fn model_dir() -> Result<std::path::PathBuf> {
-    let base = dirs_home()
-        .join(".cache/huggingface/hub/models--nvidia--llama-nemotron-rerank-1b-v2/snapshots");
+/// Resolve `~/.cache/huggingface/hub/models--<org>--<name>/snapshots/*` for any HF
+/// repo id (e.g. "nvidia/llama-nemotron-rerank-1b-v2", "KaLM-Embedding/KaLM-Reranker-V1-Small").
+fn model_dir(repo_id: &str) -> Result<std::path::PathBuf> {
+    let slug = repo_id.replace('/', "--");
+    let base = dirs_home().join(format!(".cache/huggingface/hub/models--{slug}/snapshots"));
     let snap = std::fs::read_dir(&base)
         .with_context(|| format!("reading {}", base.display()))?
         .filter_map(|e| e.ok())
@@ -241,6 +248,55 @@ impl Model {
 
 fn prompt(q: &str, p: &str) -> String {
     format!("question:{q} \n \n passage:{p}")
+}
+
+/// Which backend architecture a snapshot's config.json selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arch {
+    /// nvidia llama-nemotron-rerank (model_type "llama_bidirec").
+    Nemotron,
+    /// KaLM-Reranker-V1 t5gemma2 encoder-decoder.
+    Kalm,
+}
+
+/// Detect the architecture from a snapshot's config.json.
+fn detect_arch(dir: &std::path::Path) -> Result<Arch> {
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+    let mt = cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let arch0 = cfg
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if mt == "llama_bidirec" || arch0.starts_with("LlamaBidirectional") {
+        Ok(Arch::Nemotron)
+    } else if mt == "t5gemma2" || arch0.starts_with("T5Gemma2") {
+        Ok(Arch::Kalm)
+    } else {
+        Err(anyhow!(
+            "unrecognized architecture: model_type={mt:?} architectures[0]={arch0:?}"
+        ))
+    }
+}
+
+/// Loaded reranker engine: one process loads exactly one model.
+enum Engine {
+    Nemotron(Model),
+    Kalm(kalm::KalmModel),
+}
+
+impl Engine {
+    /// Score docs for a query, returning relevance in ORIGINAL doc order.
+    fn score(&self, tok: &Tokenizer, query: &str, docs: &[String]) -> Result<Vec<f32>> {
+        match self {
+            // Nemotron: length-sorted deferred-eval path (default sub-batch 10).
+            Engine::Nemotron(m) => run(m, tok, query, docs, SUB_BATCH),
+            // KaLM: encoder-decoder path (default sub-batch 25, matching the Python ref).
+            Engine::Kalm(m) => m.score(tok, query, docs, kalm::SUBB_DEFAULT),
+        }
+    }
 }
 
 /// Tokenize a batch of strings (one parallel `encode_batch`); propagate `tokenizers::Error`.
@@ -449,15 +505,14 @@ struct RerankResponse {
 /// Score documents for one rerank request, reusing the model forward.
 /// Returns results sorted by relevance DESC, truncated to top_n (all if None).
 fn rerank(
-    model: &Model,
+    engine: &Engine,
     tok: &Tokenizer,
     req: &RerankRequest,
 ) -> Result<RerankResponse> {
     if req.documents.is_empty() {
         return Ok(RerankResponse { results: vec![] });
     }
-    // Default sub-batch 10 (the fastest config from the sweep).
-    let scores = run(model, tok, &req.query, &req.documents, 10)?;
+    let scores = engine.score(tok, &req.query, &req.documents)?;
     let mut results: Vec<RerankResult> = scores
         .iter()
         .enumerate()
@@ -480,7 +535,7 @@ fn rerank(
 /// Synchronous, single-threaded blocking server: one request at a time (matches
 /// the single GPU and the pipeline's cap-1 queue). Loads nothing here; model+tok
 /// are already loaded by the caller.
-fn serve_http(model: &Model, tok: &Tokenizer, port: u16) -> Result<()> {
+fn serve_http(engine: &Engine, tok: &Tokenizer, port: u16) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| anyhow!("failed to bind {addr}: {e}"))?;
@@ -519,7 +574,7 @@ fn serve_http(model: &Model, tok: &Tokenizer, port: u16) -> Result<()> {
             }
         };
 
-        let response = match rerank(model, tok, &req) {
+        let response = match rerank(engine, tok, &req) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("rerank error: {e}");
@@ -611,17 +666,31 @@ fn main() -> Result<()> {
         }
     }
 
-    let dir = model_dir()?;
+    // Model selection: RERANK_MODEL=<hf-repo-id> (default = Nemotron, back-compat).
+    let repo_id = std::env::var("RERANK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let dir = model_dir(&repo_id)?;
+    let arch = detect_arch(&dir)?;
+    eprintln!("model: {repo_id} ({arch:?})");
     eprintln!("model dir: {}", dir.display());
     let load_t = Instant::now();
-    let model = Model::load(&dir)?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.json"))
         .map_err(|e| anyhow!("tokenizer: {e}"))?;
+    let engine = match arch {
+        Arch::Nemotron => Engine::Nemotron(Model::load(&dir)?),
+        Arch::Kalm => Engine::Kalm(kalm::KalmModel::load(&dir, &tok)?),
+    };
     eprintln!("loaded in {:?}", load_t.elapsed());
 
     if serve {
-        return serve_http(&model, &tok, port);
+        return serve_http(&engine, &tok, port);
     }
+
+    // The remaining CLI paths (dump/sweep/bench) read a fixed payload file and exercise
+    // Nemotron-specific run variants. For KaLM, route everything through Engine::score.
+    let model = match &engine {
+        Engine::Nemotron(m) => Some(m),
+        Engine::Kalm(_) => None,
+    };
 
     // payload 0
     let line = std::fs::read_to_string("/tmp/rerank_payloads.jsonl")?
@@ -644,8 +713,11 @@ fn main() -> Result<()> {
     eprintln!("scoring {} docs", docs.len());
 
     if let Some(out) = dump {
-        // Stage B: per-doc scores in ORIGINAL order, with the exact prompt, no sorting tricks.
-        let scores = run(&model, &tok, &q, &docs, sub_batch)?;
+        // Per-doc scores in ORIGINAL order (works for either backend via Engine::score).
+        let scores = match model {
+            Some(m) => run(m, &tok, &q, &docs, sub_batch)?,
+            None => engine.score(&tok, &q, &docs)?,
+        };
         let mut obj = serde_json::Map::new();
         obj.insert("query".into(), serde_json::json!(q));
         obj.insert("scores".into(), serde_json::json!(scores));
@@ -678,14 +750,24 @@ fn main() -> Result<()> {
         Ok((min, median, mean, t3))
     };
 
+    // KaLM has a single forward path; run a plain bench through Engine::score.
+    let model = match model {
+        Some(m) => m,
+        None => {
+            println!("{repo_id} mlx-rs, payload 0, {} docs:", docs.len());
+            let _ = bench("kalm", &|| engine.score(&tok, &q, &docs))?;
+            return Ok(());
+        }
+    };
+
     if sweep {
         println!("Nemotron-1B mlx-rs sweep, payload 0, {} docs (deferred-eval):", docs.len());
         for &sb in &[100usize, 50, 25, 10] {
-            let (_, _, _, _) = bench(&format!("subbatch={sb}"), &|| run(&model, &tok, &q, &docs, sb))?;
+            let (_, _, _, _) = bench(&format!("subbatch={sb}"), &|| run(model, &tok, &q, &docs, sb))?;
         }
         // Bonus: deferred-eval + tokenization overlap at the default sub-batch.
         println!("  --- tokenization overlap (subbatch={sub_batch}) ---");
-        let _ = bench("overlap", &|| run_overlap(&model, &tok, &q, &docs, sub_batch))?;
+        let _ = bench("overlap", &|| run_overlap(model, &tok, &q, &docs, sub_batch))?;
         return Ok(());
     }
 
@@ -695,11 +777,11 @@ fn main() -> Result<()> {
         docs.len()
     );
     if perchunk {
-        let _ = bench("per-chunk-eval", &|| run_perchunk(&model, &tok, &q, &docs, sub_batch))?;
+        let _ = bench("per-chunk-eval", &|| run_perchunk(model, &tok, &q, &docs, sub_batch))?;
     } else if overlap {
-        let _ = bench("overlap", &|| run_overlap(&model, &tok, &q, &docs, sub_batch))?;
+        let _ = bench("overlap", &|| run_overlap(model, &tok, &q, &docs, sub_batch))?;
     } else {
-        let _ = bench("deferred-eval", &|| run(&model, &tok, &q, &docs, sub_batch))?;
+        let _ = bench("deferred-eval", &|| run(model, &tok, &q, &docs, sub_batch))?;
     }
     Ok(())
 }
