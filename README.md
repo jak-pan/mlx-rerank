@@ -4,7 +4,7 @@ A fast, in-process **MLX cross-encoder reranker server** for Apple Silicon. No
 PyTorch in the process — weights, tokenizer, and the full forward pass are
 hand-built in Rust on top of [`mlx-rs`](https://crates.io/crates/mlx-rs).
 
-It runs strong rerankers natively on Metal behind one **Cohere-compatible HTTP
+It runs strong rerankers natively on Metal behind one HTTP
 `/rerank` server**, picked at startup via `RERANK_MODEL` (see *Model selection*
 below):
 
@@ -37,8 +37,7 @@ or building the inference path by hand in MLX. This is that hand-built path.
 What you get:
 
 - **~5x faster than PyTorch.** ~1.43s / 100 docs here vs ~5.5s for Nemotron under
-  PyTorch-MPS, on the identical payload. (Cohere's hosted API is ~0.3s; local is
-  slower but free, offline, and tunable.) Full numbers and the optimization story
+  PyTorch-MPS, on the identical payload. Full numbers and the optimization story
   are in [BENCHMARKS.md](BENCHMARKS.md).
 - **Bit-faithful to the original weights.** Validated against the PyTorch
   reference: single-doc P(yes) = 0.14934 (MLX) vs 0.15001 (PyTorch), diff 0.0007;
