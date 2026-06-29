@@ -1,19 +1,24 @@
-# mlx-nemo-rerank
+# mlx-rerank
 
-A fast, in-process **MLX reranker engine** for
-[`nvidia/llama-nemotron-rerank-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2),
-running natively on Apple Metal. No PyTorch in the process — weights, tokenizer,
-and the full forward pass are all hand-built in Rust on top of
-[`mlx-rs`](https://crates.io/crates/mlx-rs).
+A fast, in-process **MLX cross-encoder reranker server** for Apple Silicon. No
+PyTorch in the process — weights, tokenizer, and the full forward pass are
+hand-built in Rust on top of [`mlx-rs`](https://crates.io/crates/mlx-rs).
 
-It does one thing: take a query and a list of candidate documents, score each
-`(query, document)` pair with the Nemotron-1B cross-encoder, and return them
-reordered best-first. It ships both as a CLI (for benchmarking and one-shot
-scoring) and as a small **Cohere-compatible HTTP `/rerank` server** you can point
-a retrieval pipeline at.
+It runs strong rerankers natively on Metal behind one **Cohere-compatible HTTP
+`/rerank` server**, picked at startup via `RERANK_MODEL` (see *Model selection*
+below):
 
-> Companion model card / weights documentation:
-> [`llama-nemotron-rerank-1b-v2-mlx`](https://huggingface.co/jak-pan/llama-nemotron-rerank-1b-v2-mlx).
+- **NVIDIA [`llama-nemotron-rerank-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2)** — a Llama-3.2 bidirectional cross-encoder.
+- **[`KaLM-Reranker-V1`](https://huggingface.co/KaLM-Embedding)** (Nano + Small) — a t5gemma2 encoder-decoder reranker (FBNL).
+
+Give it a query and candidate docs; it scores each `(query, doc)` pair and returns
+them reordered best-first. Ships as a CLI (benchmarking / one-shot scoring) and the
+server.
+
+> Companion MLX model cards:
+> [`llama-nemotron-rerank-1b-v2-mlx`](https://huggingface.co/jak-pan/llama-nemotron-rerank-1b-v2-mlx) ·
+> [`kalm-reranker-v1-nano-mlx`](https://huggingface.co/jak-pan/kalm-reranker-v1-nano-mlx) ·
+> [`kalm-reranker-v1-small-mlx`](https://huggingface.co/jak-pan/kalm-reranker-v1-small-mlx)
 
 ---
 
