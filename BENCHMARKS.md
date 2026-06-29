@@ -14,8 +14,7 @@ reproduce the headline table with `target/release/rerank --sweep`.
 
 | Stack | Latency / 100 docs | Notes |
 |---|---|---|
-| Cohere `rerank-4-fast` (remote API) | **~0.3 s** | Hosted; the latency bar. ~$0.001 / 1k queries. |
-| **Nemotron-1B MLX (this engine)** | **~1.43 s** | sub_batch=10, length-sorted, deferred-eval. Local, free, offline. |
+| **Nemotron-1B MLX (this engine)** | **~1.43 s** | sub_batch=10, length-sorted, deferred-eval. |
 | Nemotron-1B MLX (pre-sweep) | ~1.93 s | sub_batch=25 — the earlier, larger-batch measurement. |
 | Nemotron-1B PyTorch-MPS | **~5.5 s** | Same model, same payload, PyTorch's Metal backend. |
 
