@@ -30,7 +30,8 @@ const RMS_EPS: f32 = 1e-5;
 const ROPE_THETA: f32 = 500000.0;
 const SDPA_SCALE: f32 = 0.125; // 1/sqrt(64)
 const MAX_LEN: usize = 512;
-const SUB_BATCH: usize = 10; // swept optimum: length-sorted chunks at the padding-vs-launch knee
+const SUB_BATCH: usize = 10; // Nemotron default sub-batch: length-sorted padding-vs-launch
+                             // knee measured on a real 100-doc payload (see BENCHMARKS.md)
 const NEG: f32 = -6e4;
 
 /// llama3 rope_scaling params (from config.json).
@@ -291,9 +292,9 @@ impl Engine {
     /// Score docs for a query, returning relevance in ORIGINAL doc order.
     fn score(&self, tok: &Tokenizer, query: &str, docs: &[String]) -> Result<Vec<f32>> {
         match self {
-            // Nemotron: length-sorted deferred-eval path (default sub-batch 10).
+            // Nemotron: length-sorted deferred-eval path (per-arch default sub-batch).
             Engine::Nemotron(m) => run(m, tok, query, docs, SUB_BATCH),
-            // KaLM: encoder-decoder path (default sub-batch 25, matching the Python ref).
+            // KaLM: encoder-decoder path (per-arch default sub-batch).
             Engine::Kalm(m) => m.score(tok, query, docs, kalm::SUBB_DEFAULT),
         }
     }
@@ -750,12 +751,16 @@ fn main() -> Result<()> {
         Ok((min, median, mean, t3))
     };
 
-    // KaLM has a single forward path; run a plain bench through Engine::score.
+    // KaLM has a single forward path; bench it directly through KalmModel::score so
+    // --subbatch is honored (Engine::score hardcodes the production default; the bench
+    // wants the CLI value so the sub-batch knee is actually measurable).
     let model = match model {
         Some(m) => m,
         None => {
-            println!("{repo_id} mlx-rs, payload 0, {} docs:", docs.len());
-            let _ = bench("kalm", &|| engine.score(&tok, &q, &docs))?;
+            println!("{repo_id} mlx-rs, payload 0, {} docs (subbatch={sub_batch}):", docs.len());
+            if let Engine::Kalm(m) = &engine {
+                let _ = bench("kalm", &|| m.score(&tok, &q, &docs, sub_batch))?;
+            }
             return Ok(());
         }
     };

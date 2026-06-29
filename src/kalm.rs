@@ -29,7 +29,8 @@ const NEG: f32 = -1e30; // matches Python `NEG = mx.array(-1e30, mx.float32)`
 const MAX_LEN: usize = 512; // tok(..., max_length=512)
 const CHUNK: i32 = 4; // chunk-pool size (l.117 CS=4)
 
-/// Default encode sub-batch (Python ref SUBB default = 25).
+/// Default encode sub-batch for KaLM: matches the Python reference's SUBB=25 (its
+/// padding-vs-launch optimum on a real 100-doc payload). Override with --subbatch.
 pub const SUBB_DEFAULT: usize = 25;
 
 /// Config read from `config.json` (`encoder.text_config` + `decoder`), generalizing
